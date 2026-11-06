@@ -24,7 +24,9 @@ echo "✓ 已安装 $DEST"
 # PATH 检查
 if [[ ":$PATH:" != *":$DEST_DIR:"* ]]; then
   if [[ "${1:-}" == "--add-path" ]]; then
-    if ! grep -q "ports CLI PATH" "$HOME/.zshrc" 2>/dev/null; then
+    if grep -q '\.local/bin' "$HOME/.zshrc" 2>/dev/null; then
+      echo "• ~/.zshrc 已有 PATH 配置，跳过"
+    else
       cat >> "$HOME/.zshrc" <<'EOF'
 
 # >>> ports CLI PATH >>>
@@ -32,8 +34,6 @@ export PATH="$HOME/.local/bin:$PATH"
 # <<<
 EOF
       echo "✓ 已在 ~/.zshrc 追加 PATH，新开终端生效"
-    else
-      echo "• ~/.zshrc 已有 PATH 配置，跳过"
     fi
   else
     echo "⚠ $DEST_DIR 不在 PATH 中。将其加入 PATH："
@@ -42,9 +42,12 @@ EOF
   fi
 fi
 
-# 常驻守护
+# 常驻守护（失败不中断安装，守护可能只是启动慢）
 if [[ "${1:-}" != "--no-daemon" ]]; then
-  "$DEST" daemon install
+  if ! "$DEST" daemon install; then
+    echo "⚠ 守护安装步骤报失败，请稍后用 ports daemon status 复核；"
+    echo "  仍失败可查看 ~/.config/ports/daemon.log"
+  fi
 fi
 
 echo

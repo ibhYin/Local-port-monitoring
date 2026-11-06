@@ -958,17 +958,23 @@ def daemon_install():
     if rc != 0:
         print(c("✗ launchd 注册失败：%s" % out.strip(), "31"))
         return 1
-    for i in range(8):           # 最多等 4s，中段重试一次 bootstrap
+    for i in range(20):          # 最多等 10s，中途最多补试两次 bootstrap
         if daemon_alive():
             break
-        if i == 3:
+        if i in (4, 8):
             _launchctl_bootstrap()
         time.sleep(0.5)
     if daemon_alive():
         print("✓ 守护已安装并启动（每 %ds 轮询，日志 %s）"
               % (POLL_INTERVAL, DAEMON_LOG))
         return 0
-    print(c("✗ 守护未启动，请查看 %s" % DAEMON_LOG, "31"))
+    print(c("✗ 守护未启动，日志末尾：", "31"))
+    try:
+        with open(DAEMON_LOG, "r", encoding="utf-8") as f:
+            for line in f.readlines()[-3:]:
+                print("  " + line.rstrip())
+    except OSError:
+        pass
     return 1
 
 
