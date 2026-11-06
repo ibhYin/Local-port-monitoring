@@ -1,0 +1,1099 @@
+#!/usr/bin/env python3
+# -*- coding: utf-8 -*-
+"""
+ports — 本地端口监控与管理工具
+
+单文件实现：CLI + 常驻守护（launchd 托管，可选）。
+仓库：https://github.com/ibhYin/Local-port-monitoring
+
+运行数据目录：~/.config/ports/
+  state.json     守护写入的实时快照（CLI 优先读它，毫秒级返回）
+  events.log     端口出现/消失/分配/结束流水
+  registry.json  端口登记表（alloc / label）
+  daemon.log     守护进程输出
+"""
+
+import argparse
+import datetime
+import fcntl
+import json
+import os
+import re
+import shutil
+import signal
+import subprocess
+import sys
+import time
+import unicodedata
+from contextlib import contextmanager
+
+VERSION = "1.0.0"
+
+HOME = os.path.expanduser("~")
+CONFIG_DIR = os.path.join(HOME, ".config", "ports")
+STATE_FILE = os.path.join(CONFIG_DIR, "state.json")
+EVENTS_FILE = os.path.join(CONFIG_DIR, "events.log")
+REGISTRY_FILE = os.path.join(CONFIG_DIR, "registry.json")
+REGISTRY_LOCK = os.path.join(CONFIG_DIR, "registry.lock")
+DAEMON_LOCK = os.path.join(CONFIG_DIR, "daemon.lock")
+DAEMON_PID = os.path.join(CONFIG_DIR, "daemon.pid")
+DAEMON_LOG = os.path.join(CONFIG_DIR, "daemon.log")
+
+DAEMON_LABEL = "com.user.ports-agent"
+PLIST_DIR = os.path.join(HOME, "Library", "LaunchAgents")
+PLIST_PATH = os.path.join(PLIST_DIR, DAEMON_LABEL + ".plist")
+INSTALLED_PATH = os.path.join(HOME, ".local", "bin", "ports")
+
+POLL_INTERVAL = 3            # 守护轮询周期（秒）
+FAST_REFRESH_EVERY = 10      # 每 N 个周期强制全量刷新一次（约 30s）
+FRESH_WINDOW = 60            # 🆕 标记窗口（秒）
+STALE_THRESHOLD = POLL_INTERVAL * 4 + 8   # state.json 超过该秒数视为守护离线
+ALLOC_DEFAULT_START = 3000
+ALLOC_EPHEMERAL_MIN = 49152  # macOS 临时端口区起点，alloc 不往上分配
+
+LSOF = shutil.which("lsof") or "/usr/sbin/lsof"
+NETSTAT = shutil.which("netstat") or "/usr/sbin/netstat"
+PS = shutil.which("ps") or "/bin/ps"
+LAUNCHCTL = shutil.which("launchctl") or "/bin/launchctl"
+
+# launchd 环境 PATH 很短，守护调用 docker 等工具时补上常见安装位置
+EXTRA_PATH_DIRS = [
+    "/opt/homebrew/bin", "/usr/local/bin", "/usr/local/sbin",
+    os.path.join(HOME, ".orbstack", "bin"),
+]
+SYSTEM_PROTECTED = {
+    "launchd", "kernel_task", "WindowServer", "loginwindow",
+    "syslogd", "cfprefsd", "watchdogd", "hidd", "securityd",
+}
+
+USE_COLOR = sys.stdout.isatty()
+RUNNING = True
+
+
+# ---------------------------------------------------------------- 基础工具
+
+def c(text, code):
+    """按需上色（非 tty 输出自动关闭颜色）。"""
+    if not USE_COLOR:
+        return str(text)
+    return "\033[%sm%s\033[0m" % (code, text)
+
+
+def dw(s):
+    """终端显示宽度：中文/全角/emoji 按 2，变体选择符按 0。"""
+    w = 0
+    for ch in str(s):
+        o = ord(ch)
+        if ch == "\ufe0f":
+            continue
+        if unicodedata.east_asian_width(ch) in ("W", "F") or 0x1F000 <= o <= 0x1FAFF \
+                or 0x2600 <= o <= 0x27BF:
+            w += 2
+        else:
+            w += 1
+    return w
+
+
+def pad(s, width):
+    return str(s) + " " * max(0, width - dw(s))
+
+
+def ensure_config_dir():
+    os.makedirs(CONFIG_DIR, exist_ok=True)
+
+
+def run(cmd, timeout=8, full_path=False):
+    """执行外部命令，返回 (rc, stdout)。失败静默返回 rc=1。"""
+    env = None
+    if full_path:
+        env = dict(os.environ)
+        extra = [p for p in EXTRA_PATH_DIRS
+                 if os.path.isdir(p) and p not in env.get("PATH", "")]
+        if extra:
+            env["PATH"] = ":".join(extra + [env.get("PATH", "")])
+    try:
+        p = subprocess.run(cmd, capture_output=True, text=True,
+                           timeout=timeout, env=env)
+        return p.returncode, p.stdout
+    except (subprocess.TimeoutExpired, FileNotFoundError, OSError):
+        return 1, ""
+
+
+def read_json(path):
+    try:
+        with open(path, "r", encoding="utf-8") as f:
+            return json.load(f)
+    except (OSError, ValueError):
+        return None
+
+
+def save_json_atomic(path, data):
+    tmp = path + ".tmp.%d" % os.getpid()
+    with open(tmp, "w", encoding="utf-8") as f:
+        json.dump(data, f, ensure_ascii=False, indent=1)
+    os.replace(tmp, path)
+
+
+@contextmanager
+def registry_lock():
+    ensure_config_dir()
+    f = open(REGISTRY_LOCK, "w")
+    try:
+        fcntl.flock(f, fcntl.LOCK_EX)
+        yield
+    finally:
+        try:
+            fcntl.flock(f, fcntl.LOCK_UN)
+        finally:
+            f.close()
+
+
+def load_registry():
+    reg = read_json(REGISTRY_FILE)
+    if not isinstance(reg, dict) or not isinstance(reg.get("ports"), dict):
+        return {"ports": {}}
+    return reg
+
+
+def now_ts():
+    return time.time()
+
+
+def fmt_ts(ts):
+    return datetime.datetime.fromtimestamp(ts).strftime("%m-%d %H:%M:%S")
+
+
+def append_event(event, port, detail=""):
+    """events.log：时间 \t 事件 \t 端口 \t 详情，超 512KB 保留末尾 1000 行。"""
+    try:
+        ensure_config_dir()
+        if os.path.exists(EVENTS_FILE) and os.path.getsize(EVENTS_FILE) > 512 * 1024:
+            with open(EVENTS_FILE, "r", encoding="utf-8") as f:
+                lines = f.readlines()
+            with open(EVENTS_FILE, "w", encoding="utf-8") as f:
+                f.writelines(lines[-1000:])
+        with open(EVENTS_FILE, "a", encoding="utf-8") as f:
+            f.write("%s\t%s\t%s\t%s\n" % (
+                datetime.datetime.now().strftime("%Y-%m-%d %H:%M:%S"),
+                event, port, detail))
+    except OSError:
+        pass
+
+
+# ---------------------------------------------------------------- 数据采集
+
+def fast_ports():
+    """廉价扫描：netstat -anv 只读内核 socket 表，返回 {(端口, pid)} 集合。
+
+    pid 列来自 -v 输出（约 35ms），进程重启换 pid 也能被下个周期发现。
+    """
+    rc, out = run([NETSTAT, "-anv", "-p", "tcp"], timeout=5)
+    pairs = set()
+    if rc != 0:
+        return pairs
+    for line in out.splitlines():
+        parts = line.split()
+        # 列序：proto recv-q send-q local foreign state rx tx rhiwat shiwat pid ...
+        if len(parts) >= 6 and parts[5] == "LISTEN":
+            tail = parts[3].rsplit(".", 1)[-1] if "." in parts[3] else ""
+            if not tail.isdigit():
+                continue
+            pid = 0
+            if len(parts) > 10 and parts[10].isdigit():
+                pid = int(parts[10])
+            pairs.add((int(tail), pid))
+    return pairs
+
+
+def lsof_listeners():
+    """lsof 结构化输出，返回 [(port, pid, process, uid, addr)]。"""
+    rc, out = run([LSOF, "-nP", "-iTCP", "-sTCP:LISTEN", "-F", "pcnu"], timeout=15)
+    result = []
+    if rc != 0 or not out:
+        return result
+    cur = None
+    seen_addrs = set()
+    for line in out.splitlines():
+        if not line:
+            continue
+        tag, val = line[0], line[1:]
+        if tag == "p":
+            cur = {"pid": int(val or 0), "cmd": "", "uid": -1}
+        elif cur is None:
+            continue
+        elif tag == "c":
+            cur["cmd"] = val
+        elif tag == "u":
+            try:
+                cur["uid"] = int(val)
+            except ValueError:
+                pass
+        elif tag == "n" and ":" in val:
+            addr, _, port_s = val.rpartition(":")
+            if not port_s.isdigit():
+                continue
+            key = (cur["pid"], port_s)
+            if key in seen_addrs:      # 同进程 IPv4/IPv6 只留一行
+                continue
+            seen_addrs.add(key)
+            result.append((int(port_s), cur["pid"], cur["cmd"], cur["uid"], addr))
+    return result
+
+
+def docker_port_map():
+    """docker ps → {宿主端口: 'docker/容器名'}；docker 不可用则空。"""
+    if not shutil.which("docker"):
+        return {}
+    rc, out = run(["docker", "ps", "--format", "{{.Names}}|{{.Ports}}"],
+                  timeout=10, full_path=True)
+    m = {}
+    if rc != 0:
+        return m
+    for line in out.splitlines():
+        name, _, ports_s = line.partition("|")
+        if not name:
+            continue
+        for mm in re.finditer(r":(\d+)->", ports_s):
+            m[int(mm.group(1))] = "docker/" + name
+    return m
+
+
+def ssh_tunnel_map():
+    """解析 ps 中 ssh -L/-D 参数 → {pid: 'SSH 隧道 → host:port'}。"""
+    rc, out = run([PS, "-axo", "pid=,command="], timeout=5)
+    m = {}
+    if rc != 0:
+        return m
+    for line in out.splitlines():
+        pid_s, _, cmd = line.strip().partition(" ")
+        if not pid_s.isdigit() or not cmd:
+            continue
+        argv0 = cmd.split()[0] if cmd.split() else ""
+        if "ssh" not in os.path.basename(argv0):
+            continue
+        hits = []
+        for mm in re.finditer(r"(?:^|\s)-[LD]\s+(\S+)", cmd):
+            parts = mm.group(1).split(":")
+            nums = [p for p in parts if p.isdigit()]
+            if not nums:
+                continue
+            bind_port = nums[0] if len(parts) <= 3 else nums[0]
+            if mm.group(0).strip().startswith("-D"):
+                hits.append("SOCKS:%s" % bind_port)
+            elif len(parts) >= 3:
+                hits.append("%s:%s" % (parts[-2], parts[-1]))
+            else:
+                hits.append("本地转发")
+        if hits:
+            m[int(pid_s)] = "SSH 隧道 → " + ", ".join(hits[:3])
+    return m
+
+
+def batch_cwd(pids):
+    """一次 lsof 批量取进程工作目录 → {pid: cwd}。"""
+    m = {}
+    if not pids:
+        return m
+    rc, out = run([LSOF, "-a", "-p", ",".join(str(p) for p in pids),
+                   "-d", "cwd", "-F", "pn"], timeout=15)
+    if rc != 0:
+        return m
+    cur = None
+    for line in out.splitlines():
+        if line.startswith("p"):
+            try:
+                cur = int(line[1:])
+            except ValueError:
+                cur = None
+        elif line.startswith("n/") and cur:
+            m[cur] = line[1:]
+    return m
+
+
+def ps_comm_map():
+    """{pid: 可执行文件完整路径}，用于区分系统服务/应用/项目。"""
+    rc, out = run([PS, "-axo", "pid=,comm="], timeout=8)
+    m = {}
+    if rc != 0:
+        return m
+    for line in out.splitlines():
+        pid_s, _, comm = line.strip().partition(" ")
+        if pid_s.isdigit() and comm:
+            m[int(pid_s)] = comm.strip()
+    return m
+
+
+SYSTEM_PREFIXES = ("/System/", "/usr/libexec/", "/usr/sbin/", "/sbin/",
+                   "/usr/lib/", "/bin/")
+
+
+def attribute(comm, cwd):
+    """按可执行路径 + 工作目录推断来源。"""
+    if comm:
+        if comm.startswith(SYSTEM_PREFIXES) or comm == "/System":
+            return "系统服务"
+        if ".app/" in comm:
+            app = comm.split(".app/", 1)[0].rsplit("/", 1)[-1]
+            return "应用:" + app
+    if cwd and cwd not in ("/", "/System") and not cwd.startswith("/System"):
+        base = os.path.basename(cwd.rstrip("/"))
+        if base:
+            return "项目:" + base
+    return ""
+
+
+def collect_rows():
+    """全量扫描 + 归属识别，返回 rows 列表（按端口排序）。"""
+    raw = lsof_listeners()
+    if not raw:
+        return []
+    docker_map = docker_port_map()
+    ssh_map = ssh_tunnel_map()
+    docker_pids = {pid for (port, pid, _, _, _) in raw if port in docker_map}
+    unknown_pids = sorted({pid for (_, pid, _, _, _) in raw
+                           if pid not in ssh_map and pid not in docker_pids})
+    cwd_map = batch_cwd(unknown_pids)
+    comm_map = ps_comm_map()
+    rows = []
+    for port, pid, cmd, uid, addr in raw:
+        source = ""
+        if port in docker_map:
+            source = docker_map[port]
+        elif pid in ssh_map:
+            source = ssh_map[pid]
+        else:
+            source = attribute(comm_map.get(pid, ""), cwd_map.get(pid, ""))
+        rows.append({"port": port, "pid": pid, "process": cmd[:48],
+                     "uid": uid, "addr": addr, "source": source})
+    rows.sort(key=lambda r: (r["port"], r["pid"]))
+    return rows
+
+
+def merge_since(rows, old_state):
+    """沿用旧快照里端口的首次出现时间，新端口记 now。"""
+    since = dict((old_state or {}).get("since", {}) or {})
+    now = now_ts()
+    for r in rows:
+        p = str(r["port"])
+        if p not in since or not isinstance(since[p], (int, float)):
+            since[p] = now
+    return since
+
+
+def scan_state():
+    """全量扫描并生成一份完整快照。"""
+    rows = collect_rows()
+    old = read_json(STATE_FILE) or {}
+    since = merge_since(rows, old)
+    return {"updated": now_ts(), "interval": POLL_INTERVAL,
+            "daemon_pid": os.getpid(), "listeners": rows, "since": since}
+
+
+def get_snapshot(direct=False):
+    """CLI 取数：优先读守护快照；不新鲜则直扫。返回 (state, online)。
+
+    守护存活以 daemon.lock 的 flock 为准——CLI 直扫也会写 state.json，
+    只看文件新鲜度会误判在线。
+    """
+    st = read_json(STATE_FILE)
+    was_fresh = bool(st and
+                     now_ts() - st.get("updated", 0) <= STALE_THRESHOLD)
+    online = was_fresh and daemon_alive()
+    if not direct and online:
+        return st, True
+    rows = collect_rows()
+    st2 = {"updated": now_ts(), "interval": 0, "daemon_pid": 0,
+           "listeners": rows, "since": merge_since(rows, st)}
+    if not was_fresh:
+        # 守护离线：落盘直扫结果，让 🆕 标记跨运行保持一致
+        try:
+            ensure_config_dir()
+            save_json_atomic(STATE_FILE, st2)
+        except OSError:
+            pass
+    return st2, False
+
+
+# ---------------------------------------------------------------- 渲染
+
+def table(header, data, color_rows=None):
+    """对齐表格。color_rows: {行号: ANSI代码} 作用于整行文字。"""
+    widths = [dw(h) for h in header]
+    for row in data:
+        for i, cell in enumerate(row):
+            widths[i] = max(widths[i], dw(cell))
+    color_rows = color_rows or {}
+    out = []
+    out.append(c("  ".join(pad(h, widths[i])
+                           for i, h in enumerate(header)), "1"))
+    for idx, row in enumerate(data):
+        line = "  ".join(pad(cell, widths[i]) for i, cell in enumerate(row))
+        if idx in color_rows:
+            line = c(line, color_rows[idx])
+        out.append(line)
+    return out
+
+
+def render_ls(state, online, registry):
+    rows = state.get("listeners", [])
+    since = state.get("since", {})
+    reg = registry.get("ports", {})
+    live_ports = {r["port"] for r in rows}
+    now = now_ts()
+
+    data, color_rows = [], {}
+    for i, r in enumerate(rows):
+        age = now - since.get(str(r["port"]), now)
+        labeled = str(r["port"]) in reg
+        if age <= FRESH_WINDOW:
+            status = "🆕"
+        elif r["source"] or labeled:
+            status = "🟢"
+        else:
+            status = "⚠️"
+            color_rows[i] = "31"
+        data.append([status, str(r["port"]), r["process"] or "?",
+                     str(r["pid"]),
+                     r["source"] or ("未知" if status == "⚠️" else "—"),
+                     reg.get(str(r["port"]), {}).get("name", "")])
+    reserved = sorted(int(p) for p in reg if int(p) not in live_ports)
+    for p in reserved:
+        color_rows[len(data)] = "2"
+        data.append(["⚪", str(p), "-", "-", "预留",
+                     reg[str(p)].get("name", "")])
+
+    lines = table(["状态", "端口", "进程", "PID", "来源", "备注"], data,
+                  color_rows)
+    if not data:
+        lines.append("（当前没有监听端口）")
+
+    head = []
+    if online:
+        age = int(now_ts() - state.get("updated", 0))
+        head.append(c("守护在线，快照 %ds 前" % age, "2"))
+    else:
+        head.append(c("守护未运行（直扫模式）— 运行 ports daemon install 可常驻实时",
+                      "33"))
+    print(" ".join(head))
+    print("\n".join(lines))
+    n_live, n_res, n_unk = len(rows), len(reserved), sum(
+        1 for i, r in enumerate(rows) if color_rows.get(i) == "31")
+    print(c("共 %d 个监听端口 · %d 个未知 · %d 个预留" % (n_live, n_unk, n_res),
+            "2"))
+
+
+# ---------------------------------------------------------------- CLI 命令
+
+def cmd_ls(args):
+    state, online = get_snapshot(direct=args.direct)
+    render_ls(state, online, load_registry())
+    return 0
+
+
+def cmd_who(args):
+    port = args.port
+    rows = [r for r in collect_rows() if r["port"] == port]
+    reg = load_registry().get("ports", {}).get(str(port), {})
+    if not rows:
+        print("端口 %d 当前无监听%s" % (
+            port, ("，登记备注：%s" % reg.get("name")) if reg else "。"))
+        return 0
+    pids = sorted({r["pid"] for r in rows})
+    cwd_map = batch_cwd(pids)
+    docker_map = docker_port_map()
+    for pid in pids:
+        rc, out = run([PS, "-p", str(pid), "-o", "ppid=,etime=,command="],
+                      timeout=5)
+        ppid, etime, command = "", "", ""
+        if rc == 0 and out.strip():
+            fields = out.strip().split(None, 2)
+            ppid, etime = fields[0], fields[1]
+            command = fields[2] if len(fields) > 2 else ""
+        pname = ""
+        if ppid.isdigit():
+            _, pout = run([PS, "-p", ppid, "-o", "comm="], timeout=5)
+            pname = pout.strip()
+        print("端口 %d" % port)
+        print("  进程    %s (pid %d, uid %s)" % (
+            rows[0]["process"], pid,
+            next((str(r["uid"]) for r in rows if r["pid"] == pid), "?")))
+        print("  监听    %s" % ", ".join(
+            sorted({r["addr"] + ":" + str(port) for r in rows
+                    if r["pid"] == pid})))
+        print("  命令行  %s" % (command or rows[0]["process"]))
+        print("  运行    %s  父进程 %s(%s)" % (etime or "?", pname or "?", ppid))
+        if pid in cwd_map:
+            print("  工作目录  %s" % cwd_map[pid])
+        if port in docker_map:
+            print("  容器    %s" % docker_map[port])
+        if reg:
+            print("  登记    %s（%s 起）" % (
+                reg.get("name", ""), reg.get("allocated", "?")))
+        print()
+    return 0
+
+
+def _kill_one(pid):
+    try:
+        os.kill(pid, signal.SIGTERM)
+    except OSError as e:
+        return "fail", str(e)
+    deadline = time.time() + 2.0
+    while time.time() < deadline:
+        try:
+            os.kill(pid, 0)
+        except OSError:
+            return "term", ""
+        time.sleep(0.1)
+    try:
+        os.kill(pid, signal.SIGKILL)
+        return "kill", ""
+    except OSError as e:
+        return "fail", str(e)
+
+
+def cmd_kill(args):
+    ports = args.ports
+    rows_by_port = {}
+    for r in collect_rows():
+        rows_by_port.setdefault(r["port"], []).append(r)
+
+    targets, refusals = [], []
+    for port in ports:
+        rows = rows_by_port.get(port)
+        if not rows:
+            refusals.append("端口 %d 当前无监听，跳过" % port)
+            continue
+        if port < 1024 and not args.force:
+            refusals.append("端口 %d < 1024（系统保留区），需 --force 才能操作"
+                            % port)
+            continue
+        for r in rows:
+            targets.append((port, r))
+
+    for port, r in targets:
+        if r["pid"] <= 1 or r["process"] in SYSTEM_PROTECTED:
+            refusals.append("拒绝：端口 %d 的 %s(pid %d) 是系统关键进程"
+                            % (port, r["process"], r["pid"]))
+    targets = [(p, r) for (p, r) in targets
+               if r["pid"] > 1 and r["process"] not in SYSTEM_PROTECTED]
+    root_targets = [(p, r) for (p, r) in targets if r["uid"] == 0]
+    if root_targets and not args.force:
+        for port, r in root_targets:
+            refusals.append("拒绝：端口 %d 的 %s(pid %d) 属 root，需 sudo，"
+                            "加 --force 可尝试" % (port, r["process"], r["pid"]))
+        targets = [(p, r) for (p, r) in targets if r["uid"] != 0]
+
+    for msg in refusals:
+        print(c("✗ " + msg, "31"))
+    if not targets:
+        return 1 if refusals else 0
+
+    seen = set()
+    uniq = []
+    for port, r in targets:
+        if (port, r["pid"]) not in seen:
+            seen.add((port, r["pid"]))
+            uniq.append((port, r))
+    print("将要结束以下进程：")
+    for port, r in uniq:
+        print("  端口 %-6d %s (pid %d)" % (port, r["process"], r["pid"]))
+    if not args.yes:
+        try:
+            ans = input("确认？[y/N] ").strip().lower()
+        except (EOFError, KeyboardInterrupt):
+            ans = ""
+        if ans not in ("y", "yes"):
+            print("已取消。")
+            return 1
+
+    failed = 0
+    done = set()
+    for port, r in uniq:
+        if r["pid"] in done:
+            continue
+        done.add(r["pid"])
+        how, err = _kill_one(r["pid"])
+        if how == "fail":
+            failed += 1
+            print(c("✗ pid %d (%s) 无法结束：%s" % (r["pid"], r["process"], err),
+                    "31"))
+        else:
+            print("✓ 已结束 %s (pid %d)，端口 %d 已释放%s" % (
+                r["process"], r["pid"], port,
+                "（SIGKILL）" if how == "kill" else ""))
+            append_event("结束", port, "%s(pid %d)" % (r["process"], r["pid"]))
+    if not failed:
+        print(c("登记已保留，需要清除请用 ports forget <端口>", "2"))
+    return 1 if failed else 0
+
+
+def cmd_alloc(args):
+    name = args.name.strip()
+    if not name:
+        print(c("✗ 需要一个名字，例如 ports alloc myapp-web", "31"))
+        return 1
+    state, _ = get_snapshot()
+    live = {r["port"] for r in state.get("listeners", [])}
+    with registry_lock():
+        reg = load_registry()
+        for p, entry in sorted(reg["ports"].items(), key=lambda kv: int(kv[0])):
+            if entry.get("name") == name:
+                print("已有同名分配：%s → 端口 %s（复用）" % (name, p))
+                print(p)
+                return 0
+        start = max(1, args.start)
+        for port in range(start, 65536):
+            if port in live or str(port) in reg["ports"]:
+                continue
+            if port >= ALLOC_EPHEMERAL_MIN:
+                break
+            reg["ports"][str(port)] = {
+                "name": name,
+                "allocated": datetime.date.today().isoformat(),
+            }
+            save_json_atomic(REGISTRY_FILE, reg)
+            append_event("分配", port, name)
+            print("→ 分配端口 %d 给 %s（已登记，alloc 上限 %d 避开临时端口区）"
+                  % (port, name, ALLOC_EPHEMERAL_MIN - 1))
+            print(port)
+            return 0
+    print(c("✗ %d~%d 区间没有空闲端口可分配" % (start, ALLOC_EPHEMERAL_MIN - 1),
+            "31"))
+    return 1
+
+
+def cmd_label(args):
+    name = " ".join(args.text).strip()
+    if not name:
+        print(c("✗ 备注不能为空，例如 ports label 3000 前端 dev", "31"))
+        return 1
+    with registry_lock():
+        reg = load_registry()
+        entry = reg["ports"].get(str(args.port), {})
+        entry["name"] = name
+        entry.setdefault("allocated", datetime.date.today().isoformat())
+        reg["ports"][str(args.port)] = entry
+        save_json_atomic(REGISTRY_FILE, reg)
+    append_event("备注", args.port, name)
+    print("✓ 端口 %d 备注：%s" % (args.port, name))
+    return 0
+
+
+def cmd_forget(args):
+    with registry_lock():
+        reg = load_registry()
+        entry = reg["ports"].pop(str(args.port), None)
+        if entry:
+            save_json_atomic(REGISTRY_FILE, reg)
+    if entry:
+        append_event("取消登记", args.port, entry.get("name", ""))
+        print("✓ 已取消端口 %d 的登记（%s）" % (args.port, entry.get("name", "")))
+        return 0
+    print("端口 %d 本来就没有登记。" % args.port)
+    return 0
+
+
+def cmd_check(args):
+    rows = [r for r in collect_rows() if r["port"] == args.port]
+    reg = load_registry().get("ports", {}).get(str(args.port), {})
+    if rows:
+        print(c("🔴 端口 %d 被占用：" % args.port, "31"))
+        for pid in sorted({r["pid"] for r in rows}):
+            r = rows[0]
+            print("   %s (pid %d)  %s" % (r["process"], pid,
+                                          r["source"] or ""))
+        if reg:
+            print("   登记备注：%s" % reg.get("name", ""))
+        return 1
+    msg = "🟢 端口 %d 空闲" % args.port
+    if reg:
+        msg += "（已登记预留：%s）" % reg.get("name", "")
+    print(msg)
+    return 0
+
+
+def cmd_events(args):
+    try:
+        with open(EVENTS_FILE, "r", encoding="utf-8") as f:
+            lines = f.readlines()
+    except OSError:
+        print("暂无事件。")
+        return 0
+    icons = {"出现": "🟢", "消失": "⚪", "分配": "📌", "备注": "✏️ ",
+             "结束": "🔪", "取消登记": "❌"}
+    for line in lines[-args.n:]:
+        parts = line.rstrip("\n").split("\t")
+        if len(parts) >= 3:
+            icon = icons.get(parts[1], "·")
+            detail = parts[3] if len(parts) > 3 else ""
+            print("%s  %s 端口 %-6s %s  %s" % (
+                parts[0], icon, parts[2], parts[1], detail))
+        else:
+            print(line.rstrip("\n"))
+    return 0
+
+
+def cmd_edit(args):
+    ensure_config_dir()
+    if not os.path.exists(REGISTRY_FILE):
+        save_json_atomic(REGISTRY_FILE, {"ports": {}})
+    shutil.copy2(REGISTRY_FILE, REGISTRY_FILE + ".bak")
+    editor = os.environ.get("EDITOR") or os.environ.get("VISUAL") or "vi"
+    rc = subprocess.call([editor, REGISTRY_FILE])
+    if rc != 0:
+        print("编辑器退出码 %d，未校验改动。" % rc)
+        return rc
+    if read_json(REGISTRY_FILE) is None:
+        print(c("✗ 保存后的 registry.json 不是合法 JSON，已恢复备份。",
+                "31"))
+        shutil.copy2(REGISTRY_FILE + ".bak", REGISTRY_FILE)
+        return 1
+    print("✓ registry.json 已更新（原文件备份为 registry.json.bak）")
+    return 0
+
+
+def cmd_watch(args):
+    interval = max(1, args.interval)
+    tty = sys.stdout.isatty()
+    if tty:
+        sys.stdout.write("\033[?1049h")   # 进入备用屏
+    try:
+        while True:
+            state, online = get_snapshot()
+            if not tty:
+                render_ls(state, online, load_registry())
+                return 0
+            sys.stdout.write("\033[2J\033[H")
+            render_ls(state, online, load_registry())
+            sys.stdout.write(c("\n每 %ds 刷新 · Ctrl+C 退出 · %s\n"
+                               % (interval, fmt_ts(now_ts())), "2"))
+            sys.stdout.flush()
+            time.sleep(interval)
+    except KeyboardInterrupt:
+        return 0
+    finally:
+        if tty:
+            sys.stdout.write("\033[?1049l")
+            sys.stdout.flush()
+
+
+# ---------------------------------------------------------------- 守护进程
+
+def daemon_alive():
+    """以 daemon.lock 的 flock 判断守护是否存活（不截断文件）。"""
+    try:
+        fd = os.open(DAEMON_LOCK, os.O_RDWR | os.O_CREAT, 0o644)
+    except OSError:
+        return False
+    f = os.fdopen(fd, "w")
+    try:
+        fcntl.flock(f, fcntl.LOCK_EX | fcntl.LOCK_NB)
+        fcntl.flock(f, fcntl.LOCK_UN)
+        return False
+    except OSError:
+        return True
+    finally:
+        f.close()
+
+
+def _sigterm(_sig, _frame):
+    global RUNNING
+    RUNNING = False
+
+
+def cmd_agent(args):
+    """守护主循环：由 launchd 托管，一般不手动运行。"""
+    ensure_config_dir()
+    lock_f = open(DAEMON_LOCK, "w")
+    try:
+        fcntl.flock(lock_f, fcntl.LOCK_EX | fcntl.LOCK_NB)
+    except OSError:
+        print("agent 已在运行，退出。", file=sys.stderr)
+        return 0
+    with open(DAEMON_PID, "w") as f:
+        f.write(str(os.getpid()))
+    print("agent started pid=%d" % os.getpid(), flush=True)
+
+    signal.signal(signal.SIGTERM, _sigterm)
+    signal.signal(signal.SIGINT, _sigterm)
+
+    prev = read_json(STATE_FILE)
+    prev_fast = None
+    counter = 0
+    while RUNNING:
+        counter += 1
+        fast = fast_ports()
+        changed = prev_fast is None or fast != prev_fast
+        prev_fast = fast
+        if changed or counter % FAST_REFRESH_EVERY == 0:
+            try:
+                st = scan_state()
+                if prev and prev.get("listeners") is not None:
+                    prev_ports = {r["port"] for r in prev["listeners"]}
+                    cur = {r["port"]: r for r in st["listeners"]}
+                    for p in sorted(cur.keys() - prev_ports):
+                        r = cur[p]
+                        append_event("出现", p, "%s(pid %d)"
+                                     % (r["process"], r["pid"]))
+                    for p in sorted(prev_ports - cur.keys()):
+                        append_event("消失", p, "")
+                prev = st
+                save_json_atomic(STATE_FILE, st)
+            except Exception as e:   # 守护绝不因单次异常退出
+                print("agent 轮询异常：%r" % e, file=sys.stderr)
+        else:
+            # 端口集合无变化：仅刷新时间戳，CLI 可知守护 3s 内校验过
+            try:
+                if prev:
+                    st = dict(prev)
+                    st["updated"] = now_ts()
+                    st["daemon_pid"] = os.getpid()
+                    prev = st
+                    save_json_atomic(STATE_FILE, st)
+            except OSError:
+                pass
+        for _ in range(POLL_INTERVAL * 2):
+            if not RUNNING:
+                break
+            time.sleep(0.5)
+    try:
+        os.remove(DAEMON_PID)
+    except OSError:
+        pass
+    return 0
+
+
+PLIST_TEMPLATE = """<?xml version="1.0" encoding="UTF-8"?>
+<!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
+<plist version="1.0">
+<dict>
+    <key>Label</key>
+    <string>%(label)s</string>
+    <key>ProgramArguments</key>
+    <array>
+        <string>%(python)s</string>
+        <string>%(script)s</string>
+        <string>agent</string>
+    </array>
+    <key>RunAtLoad</key>
+    <true/>
+    <key>KeepAlive</key>
+    <true/>
+    <key>ProcessType</key>
+    <string>Background</string>
+    <key>LowPriorityIO</key>
+    <true/>
+    <key>EnvironmentVariables</key>
+    <dict>
+        <key>PATH</key>
+        <string>%(path)s</string>
+    </dict>
+    <key>StandardOutPath</key>
+    <string>%(log)s</string>
+    <key>StandardErrorPath</key>
+    <string>%(log)s</string>
+</dict>
+</plist>
+"""
+
+
+def _launchctl_bootout():
+    uid = os.getuid()
+    rc, _ = run([LAUNCHCTL, "bootout", "gui/%d/%s" % (uid, DAEMON_LABEL)],
+                timeout=10)
+    if rc != 0:
+        run([LAUNCHCTL, "unload", PLIST_PATH], timeout=10)
+
+
+def _launchctl_bootstrap():
+    uid = os.getuid()
+    rc, out = run([LAUNCHCTL, "bootstrap", "gui/%d" % uid, PLIST_PATH],
+                  timeout=10)
+    if rc != 0:
+        rc, out = run([LAUNCHCTL, "load", PLIST_PATH], timeout=10)
+    return rc, out
+
+
+def cmd_daemon(args):
+    if args.dcmd == "install":
+        return daemon_install()
+    if args.dcmd == "uninstall":
+        return daemon_uninstall()
+    if args.dcmd == "restart":
+        daemon_uninstall(keep_plist=False)
+        return daemon_install()
+    return daemon_status()
+
+
+def daemon_install():
+    ensure_config_dir()
+    # 守护必须跑安装拷贝（内盘），而不是仓库/移动硬盘上的文件
+    cur = os.path.realpath(__file__)
+    if os.path.abspath(cur) != os.path.abspath(INSTALLED_PATH):
+        os.makedirs(os.path.dirname(INSTALLED_PATH), exist_ok=True)
+        shutil.copy2(__file__, INSTALLED_PATH)
+        os.chmod(INSTALLED_PATH, 0o755)
+        print("已安装拷贝 → %s（守护运行此文件，不依赖本仓库位置）"
+              % INSTALLED_PATH)
+    script = os.path.realpath(INSTALLED_PATH)
+    if not os.path.exists(script):
+        print(c("✗ 未找到 %s，请先运行 install.sh" % INSTALLED_PATH, "31"))
+        return 1
+    plist = PLIST_TEMPLATE % {
+        "label": DAEMON_LABEL,
+        "python": sys.executable or "/usr/bin/python3",
+        "script": script,
+        "path": ":".join(EXTRA_PATH_DIRS + ["/usr/bin", "/bin", "/usr/sbin",
+                                            "/sbin"]),
+        "log": DAEMON_LOG,
+    }
+    os.makedirs(PLIST_DIR, exist_ok=True)
+    with open(PLIST_PATH, "w") as f:
+        f.write(plist)
+    _launchctl_bootout()
+    while daemon_alive():        # 等旧 agent 真正退出并释放 daemon.lock
+        time.sleep(0.3)
+    rc, out = _launchctl_bootstrap()
+    if rc != 0:
+        print(c("✗ launchd 注册失败：%s" % out.strip(), "31"))
+        return 1
+    for i in range(8):           # 最多等 4s，中段重试一次 bootstrap
+        if daemon_alive():
+            break
+        if i == 3:
+            _launchctl_bootstrap()
+        time.sleep(0.5)
+    if daemon_alive():
+        print("✓ 守护已安装并启动（每 %ds 轮询，日志 %s）"
+              % (POLL_INTERVAL, DAEMON_LOG))
+        return 0
+    print(c("✗ 守护未启动，请查看 %s" % DAEMON_LOG, "31"))
+    return 1
+
+
+def daemon_uninstall(keep_plist=False):
+    if os.path.exists(PLIST_PATH):
+        _launchctl_bootout()
+        if not keep_plist:
+            os.remove(PLIST_PATH)
+    deadline = time.time() + 5
+    while daemon_alive() and time.time() < deadline:
+        time.sleep(0.3)          # 等 agent 退出并释放 daemon.lock
+    try:
+        os.remove(DAEMON_PID)
+    except OSError:
+        pass
+    if not keep_plist:
+        print("✓ 守护已卸载（登记数据保留在 %s）" % CONFIG_DIR)
+
+
+def daemon_status():
+    if daemon_alive():
+        pid = ""
+        try:
+            with open(DAEMON_PID) as f:
+                pid = f.read().strip()
+        except OSError:
+            pass
+        st = read_json(STATE_FILE)
+        age = int(now_ts() - st.get("updated", 0)) if st else -1
+        print(c("🟢 守护在线 pid=%s，快照 %ds 前（每 %ds 轮询）"
+                % (pid or "?", age, POLL_INTERVAL), "32"))
+        return 0
+    print(c("⚪ 守护未运行", "33"))
+    print("  安装：ports daemon install   日志：%s" % DAEMON_LOG)
+    print("  launchd 状态：launchctl list | grep %s" % DAEMON_LABEL)
+    return 1
+
+
+# ---------------------------------------------------------------- 入口
+
+def build_parser():
+    ap = argparse.ArgumentParser(
+        prog="ports", description="本地端口监控与管理",
+        epilog="""示例：
+  ports                    实时端口表
+  ports who 3000           查端口 3000 被谁占用
+  ports kill 3000          结束占用进程
+  ports alloc myapp-web    为项目领一个不冲突的端口
+  ports watch              全屏实时视图
+  ports daemon install     安装 launchd 常驻守护""",
+        formatter_class=argparse.RawDescriptionHelpFormatter)
+    ap.add_argument("-V", "--version", action="version",
+                    version="ports %s" % VERSION)
+    sub = ap.add_subparsers(dest="cmd")
+
+    p = sub.add_parser("ls", help="实时端口表")
+    p.add_argument("--direct", action="store_true",
+                   help="跳过守护缓存，直接扫描")
+    p.set_defaults(fn=cmd_ls)
+
+    p = sub.add_parser("who", help="查端口被谁占用（详情）")
+    p.add_argument("port", type=int)
+    p.set_defaults(fn=cmd_who)
+
+    p = sub.add_parser("kill", help="结束占用端口的进程")
+    p.add_argument("ports", nargs="+", type=int, metavar="端口")
+    p.add_argument("-y", "--yes", action="store_true", help="跳过确认")
+    p.add_argument("--force", action="store_true",
+                   help="允许 <1024 端口与 root 进程")
+    p.set_defaults(fn=cmd_kill)
+
+    p = sub.add_parser("alloc", help="为项目分配一个空闲端口并登记")
+    p.add_argument("name", help="项目/用途名")
+    p.add_argument("--start", type=int, default=ALLOC_DEFAULT_START,
+                   help="起始端口（默认 3000）")
+    p.set_defaults(fn=cmd_alloc)
+
+    p = sub.add_parser("label", help="给端口加备注")
+    p.add_argument("port", type=int)
+    p.add_argument("text", nargs="+", help="备注内容")
+    p.set_defaults(fn=cmd_label)
+
+    p = sub.add_parser("forget", help="取消端口登记")
+    p.add_argument("port", type=int)
+    p.set_defaults(fn=cmd_forget)
+
+    p = sub.add_parser("check", help="查某端口是否空闲（脚本友好：空闲=0）")
+    p.add_argument("port", type=int)
+    p.set_defaults(fn=cmd_check)
+
+    p = sub.add_parser("events", help="端口出现/消失流水")
+    p.add_argument("-n", type=int, default=20, help="显示条数（默认 20）")
+    p.set_defaults(fn=cmd_events)
+
+    p = sub.add_parser("watch", help="全屏实时视图")
+    p.add_argument("--interval", type=int, default=2, help="刷新秒数")
+    p.set_defaults(fn=cmd_watch)
+
+    sub.add_parser("edit", help="用 $EDITOR 手工编辑登记表")
+
+    p = sub.add_parser("daemon", help="管理 launchd 常驻守护")
+    dsub = p.add_subparsers(dest="dcmd", required=True)
+    dsub.add_parser("install", help="安装并启动守护")
+    dsub.add_parser("uninstall", help="卸载守护")
+    dsub.add_parser("status", help="查看守护状态")
+    dsub.add_parser("restart", help="重启守护")
+    p.set_defaults(fn=cmd_daemon)
+
+    p = sub.add_parser("agent", help=argparse.SUPPRESS)
+    p.set_defaults(fn=cmd_agent)
+
+    return ap
+
+
+def main(argv=None):
+    try:
+        signal.signal(signal.SIGPIPE, signal.SIG_DFL)
+    except (AttributeError, ValueError):
+        pass
+    ap = build_parser()
+    args = ap.parse_args(argv)
+    if not getattr(args, "cmd", None):
+        return cmd_ls(args)      # 无参数 = ls
+    return args.fn(args)
+
+
+if __name__ == "__main__":
+    sys.exit(main())
