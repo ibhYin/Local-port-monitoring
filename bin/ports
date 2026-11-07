@@ -84,6 +84,13 @@ UI_HTML_INSTALL = os.path.join(HOME, ".local", "share", "ports",
                                "ports-ui.html")
 UI_TOKEN = ""                # agent 启动时生成，防跨站调用 API
 UI_PORT = 0
+STATE_SEQ = 0                # 端口/登记实质变化时 +1，SSE 据此推送，心跳不推
+
+
+def bump_seq():
+    """标记数据实质变化（GIL 下自增即可，SSE 每秒比对一次）。"""
+    global STATE_SEQ
+    STATE_SEQ += 1
 
 LSOF = shutil.which("lsof") or "/usr/sbin/lsof"
 NETSTAT = shutil.which("netstat") or "/usr/sbin/netstat"
@@ -274,21 +281,28 @@ def lsof_listeners():
     return result
 
 
+_docker_cache = {"ts": 0.0, "map": {}}   # 容器归属 60s 缓存，避免卡慢 docker ps
+
+
 def docker_port_map():
     """docker ps → {宿主端口: 'docker/容器名'}；docker 不可用则空。"""
     if not shutil.which("docker"):
         return {}
+    now = time.time()
+    if now - _docker_cache["ts"] < 60:
+        return _docker_cache["map"]
     rc, out = run(["docker", "ps", "--format", "{{.Names}}|{{.Ports}}"],
-                  timeout=10, full_path=True)
+                  timeout=5, full_path=True)
     m = {}
-    if rc != 0:
-        return m
-    for line in out.splitlines():
-        name, _, ports_s = line.partition("|")
-        if not name:
-            continue
-        for mm in re.finditer(r":(\d+)->", ports_s):
-            m[int(mm.group(1))] = "docker/" + name
+    if rc == 0:
+        for line in out.splitlines():
+            name, _, ports_s = line.partition("|")
+            if not name:
+                continue
+            for mm in re.finditer(r":(\d+)->", ports_s):
+                m[int(mm.group(1))] = "docker/" + name
+    _docker_cache["ts"] = now
+    _docker_cache["map"] = m
     return m
 
 
@@ -670,6 +684,8 @@ def do_kill(ports, force=False, confirm=None):
             killed.append({"port": port, "pid": r["pid"],
                            "process": r["process"], "how": how})
             append_event("结束", port, "%s(pid %d)" % (r["process"], r["pid"]))
+    if killed:
+        bump_seq()
     return {"killed": killed, "refusals": refusals, "failures": failures,
             "aborted": False}
 
@@ -759,6 +775,7 @@ def do_alloc(name, start=ALLOC_DEFAULT_START):
             }
             save_json_atomic(REGISTRY_FILE, reg)
             append_event("分配", port, name)
+            bump_seq()
             return port, False, ""
     return None, False, "%d~%d 区间没有空闲端口可分配" % (start,
                                                          ALLOC_EPHEMERAL_MIN - 1)
@@ -791,6 +808,7 @@ def do_label(port, name):
         reg["ports"][str(port)] = entry
         save_json_atomic(REGISTRY_FILE, reg)
     append_event("备注", port, name)
+    bump_seq()
     return True, "端口 %d 备注：%s" % (port, name)
 
 
@@ -809,6 +827,7 @@ def do_forget(port):
             save_json_atomic(REGISTRY_FILE, reg)
     if entry:
         append_event("取消登记", port, entry.get("name", ""))
+        bump_seq()
     return bool(entry), entry or {}
 
 
@@ -966,6 +985,44 @@ class APIHandler(BaseHTTPRequestHandler):
     def _json(self, obj, code=200):
         self._send(code, json.dumps(obj, ensure_ascii=False))
 
+    def _authed_stream(self, query):
+        """SSE 认证：EventSource 不能带自定义头，允许 query token。"""
+        if self.headers.get("X-Ports-Token") != UI_TOKEN and \
+                query.get("token", [""])[0] != UI_TOKEN:
+            return False
+        origin = self.headers.get("Origin", "")
+        if origin and not origin.startswith("http://127.0.0.1:") \
+                and not origin.startswith("http://localhost:"):
+            return False
+        return True
+
+    def _stream(self, query):
+        """SSE：seq 有变化立即推送全量快照；空闲时仅 15s 一次 keepalive。"""
+        if not self._authed_stream(query):
+            return self._reject()
+        try:
+            self.send_response(200)
+            self.send_header("Content-Type", "text/event-stream; charset=utf-8")
+            self.send_header("Cache-Control", "no-store")
+            self.end_headers()
+            last_sent, last_keepalive = -1, time.time()
+            while True:
+                if STATE_SEQ != last_sent:
+                    payload = {"seq": STATE_SEQ, "state": api_state(),
+                               "events": read_events(30)}
+                    self.wfile.write(("data: %s\n\n" % json.dumps(
+                        payload, ensure_ascii=False)).encode("utf-8"))
+                    self.wfile.flush()
+                    last_sent = STATE_SEQ
+                    last_keepalive = time.time()
+                elif time.time() - last_keepalive > 15:
+                    self.wfile.write(b": keepalive\n\n")
+                    self.wfile.flush()
+                    last_keepalive = time.time()
+                time.sleep(1)
+        except (OSError, ConnectionResetError, BrokenPipeError):
+            return            # 客户端断开，线程结束
+
     def _authed(self):
         if self.headers.get("X-Ports-Token") != UI_TOKEN:
             return False
@@ -990,6 +1047,8 @@ class APIHandler(BaseHTTPRequestHandler):
         if not parsed.path.startswith("/api/"):
             self._json({"error": "not found"}, 404)
             return
+        if parsed.path == "/api/stream":
+            return self._stream(query)
         if not self._authed():
             return self._reject()
         try:
@@ -1134,13 +1193,32 @@ def cmd_agent(args):
     prev = read_json(STATE_FILE)
     prev_fast = None
     counter = 0
+    try:
+        last_reg_mtime = os.path.getmtime(REGISTRY_FILE)
+    except OSError:
+        last_reg_mtime = 0
     while RUNNING:
         counter += 1
+        # CLI/面板改了登记表 → 让 SSE 客户端在 3s 内收到推送
+        try:
+            m = os.path.getmtime(REGISTRY_FILE)
+            if m != last_reg_mtime:
+                last_reg_mtime = m
+                bump_seq()
+        except OSError:
+            pass
         fast = fast_ports()
         changed = prev_fast is None or fast != prev_fast
         prev_fast = fast
         if changed or counter % FAST_REFRESH_EVERY == 0:
             try:
+                # 先发心跳再慢扫：lsof/docker 可能要数秒，期间快照也保持 ≤3s 新鲜
+                if prev:
+                    hb = dict(prev)
+                    hb["updated"] = now_ts()
+                    hb["daemon_pid"] = os.getpid()
+                    hb["ui_port"] = UI_PORT
+                    save_json_atomic(STATE_FILE, hb)
                 st = scan_state()
                 if prev and prev.get("listeners") is not None:
                     prev_ports = {r["port"] for r in prev["listeners"]}
@@ -1151,8 +1229,13 @@ def cmd_agent(args):
                                      % (r["process"], r["pid"]))
                     for p in sorted(prev_ports - cur.keys()):
                         append_event("消失", p, "")
+                sig_prev = [(r["port"], r["pid"])
+                            for r in prev["listeners"]] if prev else None
+                sig_new = [(r["port"], r["pid"]) for r in st["listeners"]]
                 prev = st
                 save_json_atomic(STATE_FILE, st)
+                if sig_prev != sig_new:
+                    bump_seq()       # 实质变化 → SSE 推送；例行刷新不推
             except Exception as e:   # 守护绝不因单次异常退出
                 print("agent 轮询异常：%r" % e, file=sys.stderr)
         else:

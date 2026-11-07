@@ -87,6 +87,7 @@
     <span><span class="dot" id="dot"></span><span id="daemonState">连接中…</span></span>
     <span id="fresh"></span>
     <span class="spacer"></span>
+    <button id="btnRefresh" title="立即刷新">↻</button>
     <input id="search" type="search" placeholder="🔍 搜索端口 / 进程 / 来源 / 备注">
     <button class="primary" id="btnAlloc">＋ 领端口</button>
   </header>
@@ -234,26 +235,61 @@ function renderEvents(events) {
     : "<div>暂无事件</div>";
 }
 
-function renderHeader() {
-  const now = Date.now() / 1000;
-  const age = now - (STATE.updated || 0);
-  const online = age <= 20;
-  $("#dot").className = "dot" + (online ? "" : " off");
-  $("#daemonState").textContent = online ? "守护在线" : "守护离线";
-  $("#banner").style.display = online ? "none" : "block";
-  $("#fresh").textContent = online ? ("快照 " + Math.round(age) + "s 前 · 每 2s 自动刷新") : "";
+/* ------------- 数据通道：SSE 实时推送 + 10s 兜底轮询 ------------- */
+let MODE = "connecting";     // connecting | push | poll | down
+
+function applyPayload(p) {
+  STATE = p.state;
+  render();
+  renderHeader();
+  if (p.events) renderEvents(p.events);
 }
 
-async function poll() {
+function pollOnce() {
+  api("/api/state").then((st) => {
+    if (MODE === "connecting" || MODE === "down") MODE = "poll";
+    applyPayload({ state: st });
+    return api("/api/events?n=30");
+  }).then((ev) => { if (ev) renderEvents(ev.events); })
+    .catch(() => {
+      if (MODE !== "push") { MODE = "down"; renderHeader(); }
+    });
+}
+
+function connectSSE() {
+  let es;
   try {
-    STATE = await api("/api/state");
-    render();
-    renderHeader();
-    const ev = await api("/api/events?n=30");
-    renderEvents(ev.events);
+    es = new EventSource("/api/stream?token=" + TOKEN);
   } catch (e) {
-    if (STATE) { $("#banner").style.display = "block"; $("#dot").className = "dot off"; $("#daemonState").textContent = "守护离线"; }
-    else toast("连接面板服务失败：" + e.message, "err");
+    MODE = "poll";
+    return;
+  }
+  es.onmessage = (e) => {
+    MODE = "push";
+    try { applyPayload(JSON.parse(e.data)); } catch (_) {}
+  };
+  es.onerror = () => {
+    // EventSource 自带重连；探测一次 403（守护重启换 token）会走 api() 的整页刷新
+    api("/api/state").catch(() => {
+      if (MODE !== "push") { MODE = "down"; renderHeader(); }
+    });
+  };
+}
+
+function renderHeader() {
+  const age = Math.max(0, Math.round(Date.now() / 1000 - (STATE?.updated || 0)));
+  const online = MODE === "push" || (MODE === "poll" && age <= 20);
+  $("#dot").className = "dot" + (online ? "" : " off");
+  $("#daemonState").textContent = online ? "守护在线" : "守护离线";
+  $("#banner").style.display = (online || MODE === "connecting") ? "none" : "block";
+  if (MODE === "push") {
+    $("#fresh").textContent = "实时推送 · 有变化立即更新，空闲零请求";
+  } else if (MODE === "poll") {
+    $("#fresh").textContent = "快照 " + age + "s 前 · 每 10s 轮询";
+  } else if (MODE === "down") {
+    $("#fresh").textContent = "";
+  } else {
+    $("#fresh").textContent = "连接中…";
   }
 }
 
@@ -421,11 +457,13 @@ $("#btnAlloc").onclick = () => {
 
 /* ---------------- 启动 ---------------- */
 $("#search").addEventListener("input", () => { if (STATE) render(); });
+$("#btnRefresh").addEventListener("click", () => pollOnce());
 document.addEventListener("visibilitychange", () => {
-  if (!document.hidden) poll();   // 切回标签页立即刷新（浏览器会节流后台页的定时器）
+  if (!document.hidden) pollOnce();   // 切回标签页立即刷新
 });
-poll();
-setInterval(poll, 2000);
+pollOnce();                            // 先画一帧
+connectSSE();                          // 推送通道建立后接管更新
+setInterval(pollOnce, 10000);          // 兜底轮询：SSE 静默损坏时保底
 </script>
 </body>
 </html>
