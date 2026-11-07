@@ -377,12 +377,32 @@ $("#btnAlloc").onclick = () => {
   $("#back").addEventListener("click", (e) => { if (e.target.id === "back") closeModal(); });
   $("#mCancel").onclick = closeModal;
   $("#allocName").focus();
+
+  // 出结果后「分配」按钮隐藏；改了输入才恢复（防止对着旧结果重复点）
+  const resetForEdit = () => {
+    if (!document.querySelector(".alloc-result")) return;
+    document.querySelector(".alloc-result").remove();
+    const go = $("#mGo");
+    go.style.display = "";
+    go.disabled = false;
+    go.textContent = "分配";
+  };
+  $("#allocName").addEventListener("input", resetForEdit);
+  $("#allocStart").addEventListener("input", resetForEdit);
+  $("#allocName").addEventListener("keydown", (e) => {
+    if (e.key === "Enter") $("#mGo").click();
+  });
+
   $("#mGo").onclick = async () => {
     const name = $("#allocName").value.trim();
     if (!name) { toast("请填写项目名", "err"); return; }
+    const go = $("#mGo");
+    go.disabled = true;
+    go.textContent = "分配中…";
     try {
       const res = await api("/api/alloc", { method: "POST",
         body: JSON.stringify({ name, start: Number($("#allocStart").value) || undefined }) });
+      go.style.display = "none";
       const reused = res.reused ? "（复用已有分配）" : "";
       $("#allocOut").innerHTML = `<div class="alloc-result">
         <div style="color:var(--dim)">端口 ${res.port} 已分配给「${esc(name)}」并登记 ${reused}</div>
@@ -391,7 +411,11 @@ $("#btnAlloc").onclick = () => {
       </div>`;
       $("#copyPort").onclick = () => copyText(String(res.port)).then(() => toast("已复制 " + res.port, "ok"));
       poll();
-    } catch (e) { toast(e.message, "err"); }
+    } catch (e) {
+      go.disabled = false;          // 失败允许修正后重试
+      go.textContent = "分配";
+      toast(e.message, "err");
+    }
   };
 };
 
