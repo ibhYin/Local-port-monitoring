@@ -88,8 +88,12 @@ cd Local-port-monitoring
 ## 安全设计
 
 - `kill` 拒绝 launchd/内核等系统关键进程；root 进程与 <1024 端口需 `--force`
-- `alloc` 只在 3000~49151 分配（避开 macOS 临时端口区与面板端口段），跳过已登记端口，
-  并对候选逐一做**真实绑定测试**（IPv4/IPv6），未监听但被占用/TIME_WAIT 的端口一律不发
+- `alloc` 只在 3000~49151 分配（避开 macOS 临时端口区与面板端口段），跳过已登记端口
+  与**知名服务默认端口**（MySQL 3306、PostgreSQL 5432、Redis 6379、MongoDB 27017、
+  AirPlay 5000/7000 等，刻意不含 3000/8000/8080 开发惯例端口），并对候选逐一做
+  **真实绑定测试**（IPv4/IPv6），未监听但被占用/TIME_WAIT 的端口一律不发
+- 避开名单可在 `ports edit` 里自定义：登记表加 `"reserved": [整数数组]` 字段，
+  缺省用内置名单（见 bin/ports 的 DEFAULT_RESERVED_PORTS）
 - 所有写操作原子落盘 + 文件锁，与守护并发安全
 
 ## License

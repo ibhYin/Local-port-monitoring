@@ -55,6 +55,29 @@ FRESH_WINDOW = 60            # 🆕 标记窗口（秒）
 STALE_THRESHOLD = POLL_INTERVAL * 4 + 8   # state.json 超过该秒数视为守护离线
 ALLOC_DEFAULT_START = 3000
 ALLOC_EPHEMERAL_MIN = 49152  # macOS 临时端口区起点，alloc 不往上分配
+# 知名服务默认端口：alloc 永不发放，避免日后跑同类服务时撞车。
+# 刻意不含 3000/8000/8080 等开发惯例端口。可在 registry.json 的
+# "reserved" 字段里自定义（整数数组，缺省用这份内置名单）。
+DEFAULT_RESERVED_PORTS = [
+    1433,   # SQL Server
+    1521,   # Oracle
+    2181,   # ZooKeeper
+    3306,   # MySQL
+    5000,   # macOS AirPlay / Flask
+    5432,   # PostgreSQL
+    5672,   # RabbitMQ
+    6379,   # Redis
+    7000,   # macOS AirPlay
+    9000,   # MinIO / ClickHouse / PHP-FPM
+    9001,   # MinIO Console
+    9090,   # Prometheus
+    9092,   # Kafka
+    9200,   # Elasticsearch
+    9300,   # Elasticsearch 节点通信
+    11211,  # Memcached
+    15672,  # RabbitMQ 管理台
+    27017,  # MongoDB
+]
 
 UI_PORT_RANGE = range(7877, 7900)          # 网页面板端口段，alloc 自动避开
 UI_HTML_INSTALL = os.path.join(HOME, ".local", "share", "ports",
@@ -719,13 +742,14 @@ def do_alloc(name, start=ALLOC_DEFAULT_START):
     live = {r["port"] for r in state.get("listeners", [])}
     with registry_lock():
         reg = load_registry()
+        reserved = set(reg.get("reserved") or DEFAULT_RESERVED_PORTS)
         for p, entry in sorted(reg["ports"].items(), key=lambda kv: int(kv[0])):
             if entry.get("name") == name:
                 return int(p), True, ""
         start = max(1, start)
         for port in range(start, ALLOC_EPHEMERAL_MIN):
             if port in live or str(port) in reg["ports"] \
-                    or port in UI_PORT_RANGE:
+                    or port in UI_PORT_RANGE or port in reserved:
                 continue
             if not port_bindable(port):
                 continue
