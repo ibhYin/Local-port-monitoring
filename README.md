@@ -32,6 +32,21 @@ cd Local-port-monitoring
 - `--no-daemon` 只装 CLI；`--add-path` 把 `~/.local/bin` 写入 `~/.zshrc` 的 PATH
 - 安装是**拷贝**（`~/.local/bin/ports`），仓库放移动硬盘也不影响使用；更新代码后重跑 `./install.sh` 即可
 
+## 网页面板（不想记命令？用这个）
+
+守护进程内置一个**仅限本机访问**的网页面板，打开方式任选：
+
+- 双击 `~/Applications/端口面板.command`（安装时自动创建）
+- 命令 `ports ui`（守护不在会自动装好再打开浏览器）
+- 浏览器直接访问面板地址（`ports daemon status` 会显示，默认 <http://127.0.0.1:7877>）
+
+面板能力：实时表格自动刷新（2s）、搜索过滤、点「停止」结束进程（带确认）、
+点「详情」看命令行/工作目录/父进程、点「备注」行内登记、领端口（结果一键复制）、
+事件流水、点「打开」直接访问该端口上的服务、点端口号复制。
+
+安全：服务只绑定 `127.0.0.1`；每次守护启动生成随机 token，页面自带；
+所有 API 要求 token 且不响应跨域预检，其它网页无法跨站调用。
+
 ## 命令
 
 | 命令 | 作用 |
@@ -45,6 +60,7 @@ cd Local-port-monitoring
 | `ports label <端口> <备注>` | 手工登记/加备注 |
 | `ports forget <端口>` | 取消登记 |
 | `ports events [-n N]` | 端口出现/消失/分配/结束流水 |
+| `ports ui` | 打开网页面板 |
 | `ports edit` | 用 `$EDITOR` 手工编辑登记表 |
 | `ports daemon install/status/restart/uninstall` | 管理常驻守护 |
 

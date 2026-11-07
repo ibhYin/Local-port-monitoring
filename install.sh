@@ -21,6 +21,23 @@ cp "$SRC" "$DEST"
 chmod +x "$DEST"
 echo "✓ 已安装 $DEST"
 
+# 网页面板文件
+SRC_DIR="$(cd "$(dirname "$0")" && pwd)"
+UI_DIR="$HOME/.local/share/ports"
+if [[ -f "$SRC_DIR/bin/ports-ui.html" ]]; then
+  mkdir -p "$UI_DIR"
+  cp "$SRC_DIR/bin/ports-ui.html" "$UI_DIR/ports-ui.html"
+  echo "✓ 已安装网页面板 $UI_DIR/ports-ui.html"
+fi
+
+# 双击启动器（不想开终端时用）
+LAUNCHER="$HOME/Applications/端口面板.command"
+if [[ -d "$HOME/Applications" ]]; then
+  printf '#!/bin/bash\nexec "$HOME/.local/bin/ports" ui\n' > "$LAUNCHER"
+  chmod +x "$LAUNCHER"
+  echo "✓ 已创建双击启动器 $LAUNCHER"
+fi
+
 # PATH 检查
 if [[ ":$PATH:" != *":$DEST_DIR:"* ]]; then
   if [[ "${1:-}" == "--add-path" ]]; then

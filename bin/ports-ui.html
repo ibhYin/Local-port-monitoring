@@ -1,0 +1,398 @@
+<!DOCTYPE html>
+<html lang="zh-CN">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>端口面板 · ports</title>
+<style>
+  :root {
+    --bg: #0f1115; --panel: #171a21; --border: #262b36;
+    --text: #d7dbe4; --dim: #7a8296; --accent: #4f8cff;
+    --green: #34c748; --yellow: #f5a623; --red: #ff5d5d;
+  }
+  * { box-sizing: border-box; }
+  body {
+    margin: 0; background: var(--bg); color: var(--text);
+    font: 14px/1.5 -apple-system, "PingFang SC", "Helvetica Neue", "Microsoft YaHei", sans-serif;
+  }
+  .wrap { max-width: 1060px; margin: 0 auto; padding: 20px 16px 60px; }
+  header { display: flex; align-items: center; gap: 12px; flex-wrap: wrap; margin-bottom: 14px; }
+  header h1 { font-size: 17px; margin: 0 8px 0 0; }
+  .dot { display: inline-block; width: 9px; height: 9px; border-radius: 50%; background: var(--green); margin-right: 5px; }
+  .dot.off { background: var(--red); }
+  #fresh { color: var(--dim); font-size: 12px; }
+  .spacer { flex: 1; }
+  input[type=search], input[type=text], input[type=number] {
+    background: var(--panel); border: 1px solid var(--border); color: var(--text);
+    border-radius: 8px; padding: 7px 12px; outline: none; font-size: 13px;
+  }
+  input:focus { border-color: var(--accent); }
+  #search { width: 220px; }
+  button {
+    background: var(--panel); border: 1px solid var(--border); color: var(--text);
+    border-radius: 8px; padding: 7px 14px; cursor: pointer; font-size: 13px;
+  }
+  button:hover { border-color: var(--accent); color: #fff; }
+  button.primary { background: var(--accent); border-color: var(--accent); color: #fff; }
+  button.primary:hover { filter: brightness(1.1); color: #fff; }
+  button.danger { color: var(--red); }
+  button.danger:hover { border-color: var(--red); }
+  .card { background: var(--panel); border: 1px solid var(--border); border-radius: 12px; overflow: hidden; }
+  table { width: 100%; border-collapse: collapse; }
+  th, td { padding: 9px 12px; text-align: left; white-space: nowrap; }
+  th { color: var(--dim); font-weight: 500; font-size: 12px; border-bottom: 1px solid var(--border); }
+  td { border-bottom: 1px solid rgba(38,43,54,.55); font-size: 13px; }
+  tr:last-child td { border-bottom: none; }
+  tbody tr:hover { background: rgba(79,140,255,.06); }
+  .chip { font-size: 15px; }
+  .src-unknown { color: var(--yellow); }
+  .dim-row td { color: var(--dim); }
+  .port-cell { cursor: pointer; font-variant-numeric: tabular-nums; }
+  .port-cell:hover { color: var(--accent); }
+  .label-cell { cursor: text; color: #c8cdd8; min-width: 90px; }
+  .label-cell:hover::after { content: " ✎"; color: var(--accent); }
+  .label-input { width: 140px; background: var(--bg); border: 1px solid var(--accent); color: var(--text); border-radius: 6px; padding: 3px 8px; font-size: 13px; }
+  .acts button { padding: 3px 10px; font-size: 12px; margin-right: 6px; border-radius: 6px; }
+  .empty { text-align: center; color: var(--dim); padding: 26px !important; }
+  details.events { margin-top: 16px; }
+  details.events summary { cursor: pointer; color: var(--dim); padding: 8px 4px; }
+  #eventList { font-size: 12.5px; color: var(--dim); max-height: 220px; overflow: auto; padding: 4px 0; }
+  #eventList div { padding: 3px 8px; }
+  #eventList b { color: var(--text); font-weight: 500; }
+  /* 弹窗 */
+  .modal-back { position: fixed; inset: 0; background: rgba(0,0,0,.55); display: flex; align-items: center; justify-content: center; z-index: 50; }
+  .modal { background: var(--panel); border: 1px solid var(--border); border-radius: 14px; padding: 20px 22px; width: min(520px, 92vw); max-height: 80vh; overflow: auto; }
+  .modal h3 { margin: 0 0 14px; font-size: 15px; }
+  .kv { display: grid; grid-template-columns: 88px 1fr; gap: 6px 10px; font-size: 13px; }
+  .kv .k { color: var(--dim); }
+  .kv .v { word-break: break-all; white-space: normal; }
+  .form-row { margin: 12px 0; }
+  .form-row label { display: block; color: var(--dim); font-size: 12px; margin-bottom: 5px; }
+  .form-row input { width: 100%; }
+  .modal-foot { display: flex; justify-content: flex-end; gap: 10px; margin-top: 18px; }
+  .alloc-result { text-align: center; padding: 10px 0 2px; }
+  .alloc-result .num { font-size: 40px; font-weight: 700; color: var(--accent); font-variant-numeric: tabular-nums; }
+  /* 提示条 */
+  #toast { position: fixed; right: 18px; bottom: 18px; z-index: 60; display: flex; flex-direction: column; gap: 8px; }
+  .toast { background: var(--panel); border: 1px solid var(--border); border-left: 3px solid var(--accent); border-radius: 10px; padding: 10px 16px; font-size: 13px; max-width: 420px; box-shadow: 0 6px 24px rgba(0,0,0,.4); }
+  .toast.ok { border-left-color: var(--green); }
+  .toast.err { border-left-color: var(--red); }
+  #banner { display: none; background: #3a2410; border: 1px solid #6b4a16; color: #f0b769; border-radius: 10px; padding: 10px 14px; margin-bottom: 12px; font-size: 13px; }
+</style>
+</head>
+<body>
+<div class="wrap">
+  <header>
+    <h1>⚡ 端口面板</h1>
+    <span><span class="dot" id="dot"></span><span id="daemonState">连接中…</span></span>
+    <span id="fresh"></span>
+    <span class="spacer"></span>
+    <input id="search" type="search" placeholder="🔍 搜索端口 / 进程 / 来源 / 备注">
+    <button class="primary" id="btnAlloc">＋ 领端口</button>
+  </header>
+  <div id="banner">⚠ 守护离线，面板无法刷新 —— 正在自动重试</div>
+
+  <div class="card">
+    <table>
+      <thead><tr>
+        <th>状态</th><th>端口</th><th>进程</th><th>PID</th><th>来源</th><th>备注</th><th style="width:170px">操作</th>
+      </tr></thead>
+      <tbody id="tbody"><tr><td class="empty" colspan="7">加载中…</td></tr></tbody>
+    </table>
+  </div>
+
+  <details class="events" open>
+    <summary>最近事件</summary>
+    <div id="eventList"></div>
+  </details>
+</div>
+
+<div id="modalHost"></div>
+<div id="toast"></div>
+
+<script>
+const TOKEN = "__PORTS_TOKEN__";
+const $ = (s) => document.querySelector(s);
+const esc = (s) => String(s ?? "").replace(/[&<>"']/g,
+  (c) => ({"&":"&amp;","<":"&lt;",">":"&gt;",'"':"&quot;","'":"&#39;"}[c]));
+
+async function api(path, opts = {}) {
+  const r = await fetch(path, {
+    headers: { "X-Ports-Token": TOKEN, "Content-Type": "application/json" },
+    ...opts,
+  });
+  const data = await r.json().catch(() => ({ error: "响应解析失败" }));
+  if (!r.ok) throw new Error(data.error || ("HTTP " + r.status));
+  return data;
+}
+
+function toast(msg, cls = "") {
+  const el = document.createElement("div");
+  el.className = "toast " + cls;
+  el.textContent = msg;
+  $("#toast").appendChild(el);
+  setTimeout(() => el.remove(), 4000);
+}
+
+function copyText(text) {
+  if (navigator.clipboard) return navigator.clipboard.writeText(text);
+  const ta = document.createElement("textarea");
+  ta.value = text; document.body.appendChild(ta);
+  ta.select(); document.execCommand("copy"); ta.remove();
+  return Promise.resolve();
+}
+
+/* ---------------- 状态渲染 ---------------- */
+let STATE = null;
+let lastSig = "";
+let lastEventsSig = "";
+
+function statusOf(r) {
+  const now = Date.now() / 1000;
+  const age = now - (STATE.since[String(r.port)] || now);
+  if (age <= 60) return { icon: "🆕", title: "刚出现（60s 内）" };
+  const labeled = STATE.registry[String(r.port)];
+  if (r.source || labeled) return { icon: "🟢", title: "运行中" };
+  return { icon: "⚠️", title: "未知进程" };
+}
+
+function render(force) {
+  // 轮询是全量拉取，但 DOM 只在数据变化时重建：
+  // 避免打断点击/行内编辑，也避免按钮在鼠标下方被换掉
+  if (!force && document.querySelector(".label-input")) return;
+  const bucket = Math.floor(Date.now() / 1000 / 30);   // 🆕 状态按 30s 粒度翻新
+  const sig = JSON.stringify([bucket, STATE.listeners, STATE.registry,
+                              STATE.since, $("#search").value]);
+  if (!force && sig === lastSig) return;
+  lastSig = sig;
+  const kw = $("#search").value.trim().toLowerCase();
+  const livePorts = new Set(STATE.listeners.map((r) => r.port));
+  const rows = STATE.listeners.filter((r) => {
+    if (!kw) return true;
+    const label = STATE.registry[String(r.port)]?.name || "";
+    return (String(r.port) + " " + r.process + " " + r.source + " " + label)
+      .toLowerCase().includes(kw);
+  });
+  const reserved = Object.entries(STATE.registry)
+    .filter(([p]) => !livePorts.has(Number(p)))
+    .sort((a, b) => a[0] - b[0])
+    .filter(([p, e]) => !kw || (p + " " + (e.name || "")).toLowerCase().includes(kw));
+
+  const tb = $("#tbody");
+  if (!rows.length && !reserved.length) {
+    tb.innerHTML = '<tr><td class="empty" colspan="7">没有匹配的端口</td></tr>';
+    return;
+  }
+  let html = "";
+  for (const r of rows) {
+    const st = statusOf(r);
+    const label = STATE.registry[String(r.port)]?.name || "";
+    html += `<tr>
+      <td class="chip" title="${esc(st.title)}">${st.icon}</td>
+      <td class="port-cell" title="点击复制端口" data-copy="${r.port}">${r.port}</td>
+      <td>${esc(r.process)}</td>
+      <td>${r.pid}</td>
+      <td class="${r.source ? "" : "src-unknown"}">${esc(r.source || "未知")}</td>
+      <td class="label-cell" data-port="${r.port}" title="点击编辑备注">${esc(label) || '<span style="color:var(--dim)">＋</span>'}</td>
+      <td class="acts">
+        <button data-act="open" data-port="${r.port}">打开</button>
+        <button data-act="who" data-port="${r.port}">详情</button>
+        <button class="danger" data-act="kill" data-port="${r.port}" data-proc="${esc(r.process)}" data-pid="${r.pid}">停止</button>
+      </td>
+    </tr>`;
+  }
+  for (const [p, e] of reserved) {
+    html += `<tr class="dim-row">
+      <td class="chip" title="已登记未运行">⚪</td>
+      <td class="port-cell" title="点击复制端口" data-copy="${p}">${p}</td>
+      <td>—</td><td>—</td><td>预留</td>
+      <td class="label-cell" data-port="${p}" title="点击编辑备注">${esc(e.name || "")}</td>
+      <td class="acts"><button data-act="forget" data-port="${p}">删除登记</button></td>
+    </tr>`;
+  }
+  tb.innerHTML = html;
+}
+
+function renderEvents(events) {
+  const sig = JSON.stringify(events);
+  if (sig === lastEventsSig) return;
+  lastEventsSig = sig;
+  const icons = { "出现": "🟢", "消失": "⚪", "分配": "📌", "备注": "✏️", "结束": "🔪", "取消登记": "❌" };
+  $("#eventList").innerHTML = events.length
+    ? [...events].reverse().map((e) =>
+        `<div>${esc(e.ts)}　${icons[e.event] || "·"} <b>端口 ${esc(e.port)}</b> ${esc(e.event)}　${esc(e.detail)}</div>`
+      ).join("")
+    : "<div>暂无事件</div>";
+}
+
+function renderHeader() {
+  const now = Date.now() / 1000;
+  const age = now - (STATE.updated || 0);
+  const online = age <= 20;
+  $("#dot").className = "dot" + (online ? "" : " off");
+  $("#daemonState").textContent = online ? "守护在线" : "守护离线";
+  $("#banner").style.display = online ? "none" : "block";
+  $("#fresh").textContent = online ? ("快照 " + Math.round(age) + "s 前 · 每 2s 自动刷新") : "";
+}
+
+async function poll() {
+  try {
+    STATE = await api("/api/state");
+    render();
+    renderHeader();
+    const ev = await api("/api/events?n=30");
+    renderEvents(ev.events);
+  } catch (e) {
+    if (STATE) { $("#banner").style.display = "block"; $("#dot").className = "dot off"; $("#daemonState").textContent = "守护离线"; }
+    else toast("连接面板服务失败：" + e.message, "err");
+  }
+}
+
+/* ---------------- 操作 ---------------- */
+$("#tbody").addEventListener("click", async (ev) => {
+  const cell = ev.target.closest("[data-copy], [data-act], .label-cell");
+  if (!cell) return;
+
+  if (cell.dataset.copy) {
+    copyText(cell.dataset.copy).then(() => toast("已复制端口 " + cell.dataset.copy, "ok"));
+    return;
+  }
+  const act = cell.dataset.act;
+  const port = Number(cell.dataset.port);
+  if (act === "kill") {
+    openConfirm(`结束进程 ${cell.dataset.proc} (pid ${cell.dataset.pid})？`,
+      `端口 ${port} 将被释放，该操作会终止对应进程。`,
+      async () => {
+        const res = await api("/api/kill", { method: "POST", body: JSON.stringify({ ports: [port] }) });
+        const r = res.result;
+        if (r.killed.length) toast(`已结束 ${r.killed[0].process} (pid ${r.killed[0].pid})，端口 ${port} 已释放`, "ok");
+        r.refusals.forEach((m) => toast(m, "err"));
+        r.failures.forEach((m) => toast(m, "err"));
+        poll();
+      });
+  } else if (act === "who") {
+    openWho(port);
+  } else if (act === "open") {
+    window.open("http://localhost:" + port + "/", "_blank");
+  } else if (act === "forget") {
+    await api("/api/forget", { method: "POST", body: JSON.stringify({ port }) });
+    toast(`已取消端口 ${port} 的登记`, "ok");
+    poll();
+  } else if (cell.classList.contains("label-cell")) {
+    editLabel(cell, port);
+  }
+});
+
+function editLabel(cell, port) {
+  if (cell.querySelector("input")) return;
+  const old = STATE.registry[String(port)]?.name || "";
+  cell.innerHTML = `<input class="label-input" value="${esc(old)}" placeholder="备注后回车">`;
+  const input = cell.querySelector("input");
+  input.focus(); input.select();
+  const done = async (save) => {
+    const text = input.value.trim();
+    cell.textContent = text || "";
+    if (save && text && text !== old) {
+      try {
+        await api("/api/label", { method: "POST", body: JSON.stringify({ port, text }) });
+        toast(`端口 ${port} 备注：${text}`, "ok");
+      } catch (e) { toast(e.message, "err"); }
+    }
+    poll();
+  };
+  input.addEventListener("keydown", (e) => {
+    if (e.key === "Enter") done(true);
+    if (e.key === "Escape") done(false);
+  });
+  input.addEventListener("blur", () => done(true));
+}
+
+/* ---------------- 弹窗 ---------------- */
+function closeModal() { $("#modalHost").innerHTML = ""; }
+document.addEventListener("keydown", (e) => { if (e.key === "Escape") closeModal(); });
+
+function openConfirm(title, body, onOk) {
+  $("#modalHost").innerHTML = `
+    <div class="modal-back" id="back"><div class="modal">
+      <h3>${esc(title)}</h3>
+      <div style="color:var(--dim);font-size:13px">${esc(body)}</div>
+      <div class="modal-foot">
+        <button id="mCancel">取消</button>
+        <button class="danger" id="mOk">确认结束</button>
+      </div>
+    </div></div>`;
+  $("#back").addEventListener("click", (e) => { if (e.target.id === "back") closeModal(); });
+  $("#mCancel").onclick = closeModal;
+  $("#mOk").onclick = async () => { closeModal(); try { await onOk(); } catch (e) { toast(e.message, "err"); } };
+}
+
+function openWho(port) {
+  api("/api/who?port=" + port).then((d) => {
+    const reg = d.registry;
+    let html = `<div class="modal-back" id="back"><div class="modal">
+      <h3>端口 ${port} 详情</h3>`;
+    if (!d.pids.length) {
+      html += `<div style="color:var(--dim)">当前无监听${reg ? "（登记：" + esc(reg.name) + "）" : ""}</div>`;
+    }
+    for (const p of d.pids) {
+      html += `<div class="kv">
+        <span class="k">进程</span><span class="v">${esc(p.process)} (pid ${p.pid})</span>
+        <span class="k">监听</span><span class="v">${esc(p.addrs.join(", "))}</span>
+        <span class="k">命令行</span><span class="v">${esc(p.command)}</span>
+        <span class="k">运行</span><span class="v">${esc(p.etime)}　父进程 ${esc(p.pname)}(${p.ppid})</span>
+        ${p.cwd ? `<span class="k">工作目录</span><span class="v">${esc(p.cwd)}</span>` : ""}
+        ${p.container ? `<span class="k">容器</span><span class="v">${esc(p.container)}</span>` : ""}
+        ${reg ? `<span class="k">登记</span><span class="v">${esc(reg.name)}（${esc(reg.allocated || "")} 起）</span>` : ""}
+      </div>`;
+    }
+    html += `<div class="modal-foot"><button onclick="closeModal()">关闭</button></div></div></div>`;
+    $("#modalHost").innerHTML = html;
+    $("#back").addEventListener("click", (e) => { if (e.target.id === "back") closeModal(); });
+  }).catch((e) => toast(e.message, "err"));
+}
+
+$("#btnAlloc").onclick = () => {
+  $("#modalHost").innerHTML = `
+    <div class="modal-back" id="back"><div class="modal">
+      <h3>为新项目领一个端口</h3>
+      <div class="form-row"><label>项目 / 用途名（同名会复用之前分配的端口）</label>
+        <input type="text" id="allocName" placeholder="例如 myapp-web"></div>
+      <div class="form-row"><label>起始端口（可选，默认 3000）</label>
+        <input type="number" id="allocStart" placeholder="3000"></div>
+      <div id="allocOut"></div>
+      <div class="modal-foot">
+        <button id="mCancel">关闭</button>
+        <button class="primary" id="mGo">分配</button>
+      </div>
+    </div></div>`;
+  $("#back").addEventListener("click", (e) => { if (e.target.id === "back") closeModal(); });
+  $("#mCancel").onclick = closeModal;
+  $("#allocName").focus();
+  $("#mGo").onclick = async () => {
+    const name = $("#allocName").value.trim();
+    if (!name) { toast("请填写项目名", "err"); return; }
+    try {
+      const res = await api("/api/alloc", { method: "POST",
+        body: JSON.stringify({ name, start: Number($("#allocStart").value) || undefined }) });
+      const reused = res.reused ? "（复用已有分配）" : "";
+      $("#allocOut").innerHTML = `<div class="alloc-result">
+        <div style="color:var(--dim)">端口 ${res.port} 已分配给「${esc(name)}」并登记 ${reused}</div>
+        <div class="num">${res.port}</div>
+        <button class="primary" id="copyPort">复制端口</button>
+      </div>`;
+      $("#copyPort").onclick = () => copyText(String(res.port)).then(() => toast("已复制 " + res.port, "ok"));
+      poll();
+    } catch (e) { toast(e.message, "err"); }
+  };
+};
+
+/* ---------------- 启动 ---------------- */
+$("#search").addEventListener("input", () => { if (STATE) render(); });
+document.addEventListener("visibilitychange", () => {
+  if (!document.hidden) poll();   // 切回标签页立即刷新（浏览器会节流后台页的定时器）
+});
+poll();
+setInterval(poll, 2000);
+</script>
+</body>
+</html>
