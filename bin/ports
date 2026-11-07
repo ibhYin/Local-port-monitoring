@@ -22,6 +22,7 @@ import re
 import secrets
 import shutil
 import signal
+import socket
 import subprocess
 import sys
 import threading
@@ -680,9 +681,36 @@ def cmd_kill(args):
                  (result["refusals"] and not result["killed"])) else 0
 
 
-def do_alloc(name, start=ALLOC_DEFAULT_START):
-    """领端口：同名复用；跳过监听中、已登记、面板端口段、临时端口区。
+def port_bindable(port):
+    """实际绑定测试：绑得上（IPv4/IPv6 通配）才算真空闲。
 
+    覆盖快照之外的占用——未 listen 的绑定、TIME_WAIT 等。
+    不设 SO_REUSEADDR，宁可保守跳过。
+    """
+    tests = [(socket.AF_INET, "0.0.0.0")]
+    if hasattr(socket, "AF_INET6"):
+        tests.append((socket.AF_INET6, "::"))
+    for family, addr in tests:
+        s = None
+        try:
+            s = socket.socket(family, socket.SOCK_STREAM)
+            s.bind((addr, port))
+        except OSError:
+            return False
+        finally:
+            if s:
+                try:
+                    s.close()
+                except OSError:
+                    pass
+    return True
+
+
+def do_alloc(name, start=ALLOC_DEFAULT_START):
+    """领端口：同名复用；只发真实可绑定的空闲端口。
+
+    跳过：快照中监听中的端口、已登记端口、面板端口段、临时端口区，
+    并对候选逐一做绑定测试。
     返回 (port, reused, err)；失败时 port 为 None。
     """
     if not name:
@@ -695,12 +723,12 @@ def do_alloc(name, start=ALLOC_DEFAULT_START):
             if entry.get("name") == name:
                 return int(p), True, ""
         start = max(1, start)
-        for port in range(start, 65536):
+        for port in range(start, ALLOC_EPHEMERAL_MIN):
             if port in live or str(port) in reg["ports"] \
                     or port in UI_PORT_RANGE:
                 continue
-            if port >= ALLOC_EPHEMERAL_MIN:
-                break
+            if not port_bindable(port):
+                continue
             reg["ports"][str(port)] = {
                 "name": name,
                 "allocated": datetime.date.today().isoformat(),
