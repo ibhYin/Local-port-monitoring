@@ -121,6 +121,15 @@ async function api(path, opts = {}) {
     headers: { "X-Ports-Token": TOKEN, "Content-Type": "application/json" },
     ...opts,
   });
+  if (r.status === 403) {
+    // 守护重启后 token 会更换：整页刷新一次拿新 token，别让页面永久卡死
+    const last = Number(sessionStorage.getItem("ports403At") || 0);
+    if (Date.now() - last > 8000) {
+      sessionStorage.setItem("ports403At", String(Date.now()));
+      location.reload();
+    }
+    throw new Error("token 已失效，正在自动刷新页面…");
+  }
   const data = await r.json().catch(() => ({ error: "响应解析失败" }));
   if (!r.ok) throw new Error(data.error || ("HTTP " + r.status));
   return data;
