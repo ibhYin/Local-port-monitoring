@@ -30,13 +30,12 @@ if [[ -f "$SRC_DIR/bin/ports-ui.html" ]]; then
   echo "✓ 已安装网页面板 $UI_DIR/ports-ui.html"
 fi
 
-# 双击启动器（不想开终端时用）
-LAUNCHER="$HOME/Applications/端口面板.command"
-if [[ -d "$HOME/Applications" ]]; then
-  printf '#!/bin/bash\nexec "$HOME/.local/bin/ports" ui\n' > "$LAUNCHER"
-  chmod +x "$LAUNCHER"
-  echo "✓ 已创建双击启动器 $LAUNCHER"
-fi
+# 双击启动器：放在项目文件夹里，好找好记
+LAUNCHER="$SRC_DIR/端口面板.command"
+printf '#!/bin/bash\nexec "$HOME/.local/bin/ports" ui\n' > "$LAUNCHER"
+chmod +x "$LAUNCHER"
+rm -f "$HOME/Applications/端口面板.command"   # 清理旧位置的启动器
+echo "✓ 已创建双击启动器 $LAUNCHER"
 
 # PATH 检查
 if [[ ":$PATH:" != *":$DEST_DIR:"* ]]; then
